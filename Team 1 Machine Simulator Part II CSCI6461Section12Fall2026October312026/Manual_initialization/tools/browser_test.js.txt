@@ -1,0 +1,105 @@
+// Verifies Program 1 inside the actual browser simulator, not the Python model.
+// Drives the real UI: loads the program, sets PC, types lines into Line Input,
+// presses Run, and reads the console printer output back.
+const { chromium } = require('playwright');
+const fs = require('fs');
+const path = require('path');
+
+// Locate the simulator and the load file wherever they sit relative to this
+// script, so the suite runs both from the working tree and from the unpacked
+// submission, where the simulator carries the long submission filename.
+function find(pattern, dirs) {
+  for (const d of dirs) {
+    if (!fs.existsSync(d)) continue;
+    const hit = fs.readdirSync(d).find(f => pattern.test(f));
+    if (hit) return path.join(d, hit);
+  }
+  throw new Error(`could not find ${pattern} in ${dirs.join(', ')}`);
+}
+
+const here = __dirname;
+const up = path.resolve(here, '..');
+const HTML = 'file://' + find(/CSCI6461Simulator\.html$/, [here, up]);
+const LOAD = fs.readFileSync(
+  find(/^program1\.load$/, [here, up, path.join(up, 'test files')]), 'utf8');
+const START_PC = 0o300;   // MAIN1
+
+function closest(nums, t) {
+  let best = null, bestd = null;
+  for (const n of nums) {
+    const d = Math.abs(n - t);
+    if (bestd === null || d < bestd) { best = n; bestd = d; }
+  }
+  return best;
+}
+
+async function runCase(page, nums, target, shotPath) {
+  // Init, then load the program through the same function the file dialog uses.
+  await page.evaluate(() => { document.getElementById('initBtn').click(); });
+  await page.evaluate(text => { loadMemoryFromText(text); }, LOAD);
+  await page.evaluate(pc => { setPC(pc); }, START_PC);
+  await page.evaluate(() => { document.getElementById('terminalClearBtn').click(); });
+
+  // Queue every line of input before starting, the way an operator would type
+  // ahead; the CHK poll loop consumes them as it goes.
+  for (const n of [...nums, target]) {
+    await page.fill('#terminalInput', String(n));
+    await page.press('#terminalInput', 'Enter');
+  }
+
+  await page.click('#runBtn');
+  await page.waitForFunction(() => halted === true, null, { timeout: 15000 });
+
+  const out = await page.inputValue('#terminalOutput');
+  if (shotPath) {
+    // Expand the console so the whole transcript is visible in the capture
+    // rather than scrolled; the assignment asks for test samples, so the
+    // screenshot has to show the input and the answer together.
+    await page.evaluate(() => {
+      const t = document.getElementById('terminalOutput');
+      t.style.height = (t.scrollHeight + 20) + 'px';
+      t.scrollTop = 0;
+    });
+    await page.screenshot({ path: shotPath, fullPage: true });
+  }
+  // The terminal echoes each typed line with a "> " prefix. Those are the
+  // operator's keystrokes, not the console printer, so drop them.
+  return out.split('\n').filter(s => s !== '' && !s.startsWith('> '));
+}
+
+(async () => {
+  const browser = await chromium.launch({ executablePath: '/opt/pw-browsers/chromium' });
+  const page = await browser.newPage({ viewport: { width: 1500, height: 1000 } });
+  page.on('dialog', d => d.accept());
+  await page.goto(HTML);
+
+  const cases = [
+    ['sample',    [100, 250, 4000, 17, 983, 12, 7, 31000, 5, 64,
+                   900, 1234, 88, 2, 19, 456, 777, 3030, 11, 60], 300],
+    ['negatives', [-100, 250, -4000, 17, -983, 12, 7, -31000, 5, 64,
+                   -900, 1234, 88, -2, 19, 456, -777, 3030, 11, -60], -950],
+    ['bounds',    [-32768, 32767, 0, -1, 1, -32767, 32766, 100, -100, 500,
+                   -500, 1000, -1000, 2, -2, 3, -3, 4, -4, 5], -32768],
+    ['exact',     [1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
+                   11, 12, 13, 14, 15, 16, 17, 18, 19, 20], 13],
+  ];
+
+  let pass = 0;
+  for (const [name, nums, target] of cases) {
+    const shot = path.resolve(__dirname, `screenshots/${name}.png`);
+    const got = await runCase(page, nums, target, shot);
+    const want = [...nums.map(String), String(target), String(closest(nums, target))];
+    const ok = JSON.stringify(got) === JSON.stringify(want);
+    console.log(`${ok ? 'PASS' : 'FAIL'}  browser: ${name}`);
+    if (!ok) {
+      console.log('   want tail', want.slice(20));
+      console.log('   got  tail', got.slice(20));
+      console.log('   full got ', JSON.stringify(got));
+    }
+    if (ok) pass++;
+  }
+
+  console.log(`\n${pass}/${cases.length} passed in the real simulator`);
+  await browser.close();
+  process.exit(pass === cases.length ? 0 : 1);
+})();
